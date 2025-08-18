@@ -8,6 +8,22 @@
 (define-constant err-invalid-amount (err u106))
 (define-constant err-task-already-executed (err u107))
 (define-constant err-minimum-approval-not-met (err u108))
+(define-constant err-invalid-milestone (err u109))
+
+(define-constant milestone-bronze-tasks u5)
+(define-constant milestone-silver-tasks u15)
+(define-constant milestone-gold-tasks u35)
+(define-constant milestone-platinum-tasks u75)
+
+(define-constant milestone-bronze-earnings u500)
+(define-constant milestone-silver-earnings u2000)
+(define-constant milestone-gold-earnings u6000)
+(define-constant milestone-platinum-earnings u15000)
+
+(define-constant tier-bronze u1)
+(define-constant tier-silver u2)
+(define-constant tier-gold u3)
+(define-constant tier-platinum u4)
 
 (define-data-var total-members uint u0)
 (define-data-var treasury-balance uint u0)
@@ -45,6 +61,15 @@
     last-active: uint
 })
 
+(define-map member-milestones principal {
+    current-tier: uint,
+    tier-achieved-at: uint,
+    bronze-achieved: bool,
+    silver-achieved: bool,
+    gold-achieved: bool,
+    platinum-achieved: bool
+})
+
 (define-public (initialize-dao)
     (begin
         (try! (add-member contract-owner u100))
@@ -64,6 +89,14 @@
             is-active: true
         })
         (var-set total-members (+ (var-get total-members) u1))
+        (map-set member-milestones new-member {
+            current-tier: u0,
+            tier-achieved-at: u0,
+            bronze-achieved: false,
+            silver-achieved: false,
+            gold-achieved: false,
+            platinum-achieved: false
+        })
         (ok true)
     )
 )
@@ -192,6 +225,7 @@
                 last-active: stacks-block-height
             })
         )
+        (try! (update-member-milestone creator))
         (ok true)
     )
 )
@@ -202,6 +236,57 @@
         (asserts! (and (>= new-percentage u1) (<= new-percentage u100)) err-invalid-amount)
         (var-set minimum-approval-percentage new-percentage)
         (ok true)
+    )
+)
+
+(define-private (calculate-tier (task-count uint) (total-earnings uint))
+    (if (and (>= task-count milestone-platinum-tasks) (>= total-earnings milestone-platinum-earnings))
+        tier-platinum
+        (if (and (>= task-count milestone-gold-tasks) (>= total-earnings milestone-gold-earnings))
+            tier-gold
+            (if (and (>= task-count milestone-silver-tasks) (>= total-earnings milestone-silver-earnings))
+                tier-silver
+                (if (and (>= task-count milestone-bronze-tasks) (>= total-earnings milestone-bronze-earnings))
+                    tier-bronze
+                    u0
+                )
+            )
+        )
+    )
+)
+
+(define-public (update-member-milestone (member principal))
+    (let (
+        (contrib-data (unwrap! (map-get? member-contributions member) err-not-member))
+        (milestone-data (unwrap! (map-get? member-milestones member) err-not-member))
+        (task-count (get tasks-completed contrib-data))
+        (total-earnings (get total-compensation contrib-data))
+        (new-tier (calculate-tier task-count total-earnings))
+        (current-tier (get current-tier milestone-data))
+        (member-data (unwrap! (map-get? members member) err-not-member))
+        (base-voting-power (get voting-power member-data))
+    )
+        (if (> new-tier current-tier)
+            (let (
+                (tier-multiplier (if (is-eq new-tier tier-platinum) u4
+                                 (if (is-eq new-tier tier-gold) u3
+                                 (if (is-eq new-tier tier-silver) u2
+                                 (if (is-eq new-tier tier-bronze) u1 u1)))))
+                (new-voting-power (* base-voting-power (+ u1 tier-multiplier)))
+            )
+                (map-set member-milestones member {
+                    current-tier: new-tier,
+                    tier-achieved-at: stacks-block-height,
+                    bronze-achieved: (or (get bronze-achieved milestone-data) (is-eq new-tier tier-bronze)),
+                    silver-achieved: (or (get silver-achieved milestone-data) (is-eq new-tier tier-silver)),
+                    gold-achieved: (or (get gold-achieved milestone-data) (is-eq new-tier tier-gold)),
+                    platinum-achieved: (or (get platinum-achieved milestone-data) (is-eq new-tier tier-platinum))
+                })
+                (map-set members member (merge member-data {voting-power: new-voting-power}))
+                (ok true)
+            )
+            (ok false)
+        )
     )
 )
 
@@ -285,5 +370,73 @@
             )
         )
         u0
+    )
+)
+
+(define-read-only (get-member-milestone (member principal))
+    (map-get? member-milestones member)
+)
+
+(define-read-only (get-member-tier (member principal))
+    (match (map-get? member-milestones member)
+        milestone-data (get current-tier milestone-data)
+        u0
+    )
+)
+
+(define-read-only (get-tier-name (tier uint))
+    (if (is-eq tier tier-platinum)
+        "Platinum"
+        (if (is-eq tier tier-gold)
+            "Gold"
+            (if (is-eq tier tier-silver)
+                "Silver"
+                (if (is-eq tier tier-bronze)
+                    "Bronze"
+                    "None"
+                )
+            )
+        )
+    )
+)
+
+(define-read-only (check-milestone-eligibility (member principal))
+    (match (map-get? member-contributions member)
+        contrib-data (let (
+            (task-count (get tasks-completed contrib-data))
+            (total-earnings (get total-compensation contrib-data))
+            (next-tier (calculate-tier task-count total-earnings))
+        )
+            {
+                eligible-tier: next-tier,
+                tasks-completed: task-count,
+                total-earnings: total-earnings,
+                bronze-progress: {
+                    tasks-needed: (if (>= task-count milestone-bronze-tasks) u0 (- milestone-bronze-tasks task-count)),
+                    earnings-needed: (if (>= total-earnings milestone-bronze-earnings) u0 (- milestone-bronze-earnings total-earnings))
+                },
+                silver-progress: {
+                    tasks-needed: (if (>= task-count milestone-silver-tasks) u0 (- milestone-silver-tasks task-count)),
+                    earnings-needed: (if (>= total-earnings milestone-silver-earnings) u0 (- milestone-silver-earnings total-earnings))
+                },
+                gold-progress: {
+                    tasks-needed: (if (>= task-count milestone-gold-tasks) u0 (- milestone-gold-tasks task-count)),
+                    earnings-needed: (if (>= total-earnings milestone-gold-earnings) u0 (- milestone-gold-earnings total-earnings))
+                },
+                platinum-progress: {
+                    tasks-needed: (if (>= task-count milestone-platinum-tasks) u0 (- milestone-platinum-tasks task-count)),
+                    earnings-needed: (if (>= total-earnings milestone-platinum-earnings) u0 (- milestone-platinum-earnings total-earnings))
+                }
+            }
+        )
+        {
+            eligible-tier: u0,
+            tasks-completed: u0,
+            total-earnings: u0,
+            bronze-progress: {tasks-needed: milestone-bronze-tasks, earnings-needed: milestone-bronze-earnings},
+            silver-progress: {tasks-needed: milestone-silver-tasks, earnings-needed: milestone-silver-earnings},
+            gold-progress: {tasks-needed: milestone-gold-tasks, earnings-needed: milestone-gold-earnings},
+            platinum-progress: {tasks-needed: milestone-platinum-tasks, earnings-needed: milestone-platinum-earnings}
+        }
     )
 )
