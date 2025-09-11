@@ -9,6 +9,19 @@
 (define-constant err-task-already-executed (err u107))
 (define-constant err-minimum-approval-not-met (err u108))
 (define-constant err-invalid-milestone (err u109))
+(define-constant err-proposal-not-found (err u110))
+(define-constant err-already-voted-proposal (err u111))
+(define-constant err-proposal-not-ready (err u112))
+(define-constant err-proposal-expired (err u113))
+(define-constant err-invalid-proposal-type (err u114))
+(define-constant err-proposal-already-executed (err u115))
+
+(define-constant proposal-type-parameter-change u1)
+(define-constant proposal-type-treasury-allocation u2)
+(define-constant proposal-type-member-management u3)
+
+(define-constant default-voting-period u1008)
+(define-constant execution-delay u144)
 
 (define-constant milestone-bronze-tasks u5)
 (define-constant milestone-silver-tasks u15)
@@ -29,6 +42,7 @@
 (define-data-var treasury-balance uint u0)
 (define-data-var task-counter uint u0)
 (define-data-var minimum-approval-percentage uint u60)
+(define-data-var proposal-counter uint u0)
 
 (define-map members principal {
     voting-power: uint,
@@ -69,6 +83,23 @@
     gold-achieved: bool,
     platinum-achieved: bool
 })
+
+(define-map proposals uint {
+    proposer: principal,
+    title: (string-ascii 100),
+    description: (string-ascii 500),
+    proposal-type: uint,
+    target-parameter: (string-ascii 50),
+    new-value: uint,
+    created-at: uint,
+    voting-deadline: uint,
+    execution-time: uint,
+    is-executed: bool,
+    yes-votes: uint,
+    no-votes: uint
+})
+
+(define-map proposal-votes {proposal-id: uint, voter: principal} bool)
 
 (define-public (initialize-dao)
     (begin
@@ -300,6 +331,99 @@
     )
 )
 
+(define-public (submit-proposal 
+    (title (string-ascii 100))
+    (description (string-ascii 500))
+    (proposal-type uint)
+    (target-parameter (string-ascii 50))
+    (new-value uint)
+)
+    (let (
+        (proposal-id (+ (var-get proposal-counter) u1))
+        (voting-deadline (+ stacks-block-height default-voting-period))
+        (execution-time (+ voting-deadline execution-delay))
+        (member-data (unwrap! (map-get? members tx-sender) err-not-member))
+    )
+        (asserts! (get is-active member-data) err-not-member)
+        (asserts! (or (or (is-eq proposal-type proposal-type-parameter-change)
+                         (is-eq proposal-type proposal-type-treasury-allocation))
+                     (is-eq proposal-type proposal-type-member-management)) err-invalid-proposal-type)
+        (map-set proposals proposal-id {
+            proposer: tx-sender,
+            title: title,
+            description: description,
+            proposal-type: proposal-type,
+            target-parameter: target-parameter,
+            new-value: new-value,
+            created-at: stacks-block-height,
+            voting-deadline: voting-deadline,
+            execution-time: execution-time,
+            is-executed: false,
+            yes-votes: u0,
+            no-votes: u0
+        })
+        (var-set proposal-counter proposal-id)
+        (ok proposal-id)
+    )
+)
+
+(define-public (vote-on-proposal (proposal-id uint) (vote bool))
+    (let (
+        (proposal-data (unwrap! (map-get? proposals proposal-id) err-proposal-not-found))
+        (member-data (unwrap! (map-get? members tx-sender) err-not-member))
+        (vote-key {proposal-id: proposal-id, voter: tx-sender})
+    )
+        (asserts! (get is-active member-data) err-not-member)
+        (asserts! (<= stacks-block-height (get voting-deadline proposal-data)) err-voting-closed)
+        (asserts! (is-none (map-get? proposal-votes vote-key)) err-already-voted-proposal)
+        (asserts! (not (get is-executed proposal-data)) err-proposal-already-executed)
+        
+        (map-set proposal-votes vote-key vote)
+        
+        (if vote
+            (map-set proposals proposal-id (merge proposal-data {
+                yes-votes: (+ (get yes-votes proposal-data) (get voting-power member-data))
+            }))
+            (map-set proposals proposal-id (merge proposal-data {
+                no-votes: (+ (get no-votes proposal-data) (get voting-power member-data))
+            }))
+        )
+        (ok true)
+    )
+)
+
+(define-public (execute-proposal (proposal-id uint))
+    (let (
+        (proposal-data (unwrap! (map-get? proposals proposal-id) err-proposal-not-found))
+        (total-votes (+ (get yes-votes proposal-data) (get no-votes proposal-data)))
+        (approval-rate (if (> total-votes u0) 
+            (* (/ (get yes-votes proposal-data) total-votes) u100) 
+            u0))
+    )
+        (asserts! (> stacks-block-height (get execution-time proposal-data)) err-proposal-not-ready)
+        (asserts! (not (get is-executed proposal-data)) err-proposal-already-executed)
+        (asserts! (>= approval-rate (var-get minimum-approval-percentage)) err-minimum-approval-not-met)
+        
+        (map-set proposals proposal-id (merge proposal-data {is-executed: true}))
+        
+        (if (is-eq (get proposal-type proposal-data) proposal-type-parameter-change)
+            (execute-parameter-change (get target-parameter proposal-data) (get new-value proposal-data))
+            (ok true)
+        )
+    )
+)
+
+(define-private (execute-parameter-change (parameter (string-ascii 50)) (value uint))
+    (if (is-eq parameter "minimum-approval")
+        (begin
+            (asserts! (and (>= value u1) (<= value u100)) err-invalid-amount)
+            (var-set minimum-approval-percentage value)
+            (ok true)
+        )
+        (ok true)
+    )
+)
+
 (define-read-only (get-member (member principal))
     (map-get? members member)
 )
@@ -438,5 +562,57 @@
             gold-progress: {tasks-needed: milestone-gold-tasks, earnings-needed: milestone-gold-earnings},
             platinum-progress: {tasks-needed: milestone-platinum-tasks, earnings-needed: milestone-platinum-earnings}
         }
+    )
+)
+
+(define-read-only (get-proposal (proposal-id uint))
+    (map-get? proposals proposal-id)
+)
+
+(define-read-only (get-proposal-vote (proposal-id uint) (voter principal))
+    (map-get? proposal-votes {proposal-id: proposal-id, voter: voter})
+)
+
+(define-read-only (get-proposal-counter)
+    (var-get proposal-counter)
+)
+
+(define-read-only (get-proposal-voting-status (proposal-id uint))
+    (match (map-get? proposals proposal-id)
+        proposal-data {
+            yes-votes: (get yes-votes proposal-data),
+            no-votes: (get no-votes proposal-data),
+            voting-active: (<= stacks-block-height (get voting-deadline proposal-data)),
+            execution-ready: (> stacks-block-height (get execution-time proposal-data)),
+            is-executed: (get is-executed proposal-data)
+        }
+        {yes-votes: u0, no-votes: u0, voting-active: false, execution-ready: false, is-executed: false}
+    )
+)
+
+(define-read-only (is-proposal-approved (proposal-id uint))
+    (match (map-get? proposals proposal-id)
+        proposal-data (let (
+            (total-votes (+ (get yes-votes proposal-data) (get no-votes proposal-data)))
+            (approval-rate (if (> total-votes u0) 
+                (* (/ (get yes-votes proposal-data) total-votes) u100) 
+                u0))
+        )
+            (>= approval-rate (var-get minimum-approval-percentage))
+        )
+        false
+    )
+)
+
+(define-read-only (get-proposal-type-name (proposal-type uint))
+    (if (is-eq proposal-type proposal-type-parameter-change)
+        "Parameter Change"
+        (if (is-eq proposal-type proposal-type-treasury-allocation)
+            "Treasury Allocation"
+            (if (is-eq proposal-type proposal-type-member-management)
+                "Member Management"
+                "Unknown"
+            )
+        )
     )
 )
