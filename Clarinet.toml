@@ -1,0 +1,25 @@
+[project]
+name = 'DAO-for-Remote-Team-Compensation'
+description = 'A comprehensive DAO system for remote team compensation with rewards distribution'
+authors = []
+telemetry = true
+cache_dir = './.cache'
+requirements = []
+
+[contracts.dao-rewards-system]
+path = 'contracts/dao-rewards-system.clar'
+clarity_version = 3
+epoch = 3.1
+
+[repl.analysis]
+passes = ['check_checker']
+
+[repl.analysis.check_checker]
+strict = false
+trusted_sender = false
+trusted_caller = false
+callee_filter = false
+
+[repl.remote_data]
+enabled = false
+api_url = 'https://api.hiro.so'
