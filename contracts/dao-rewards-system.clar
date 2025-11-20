@@ -19,6 +19,9 @@
 (define-constant err-no-eligible-members (err u111))
 (define-constant err-reward-pool-insufficient (err u112))
 (define-constant err-invalid-contribution-score (err u113))
+(define-constant err-cannot-delegate-to-self (err u114))
+(define-constant err-delegate-not-member (err u115))
+(define-constant err-no-delegation-exists (err u116))
 
 ;; System constants
 (define-constant default-voting-period u1008)
@@ -100,6 +103,17 @@
     last-reward-date: uint,
     reward-multiplier: uint,
     lifetime-contribution-score: uint
+})
+
+(define-map vote-delegations principal {
+    delegate: principal,
+    delegated-at: uint,
+    is-active: bool
+})
+
+(define-map delegation-received principal {
+    total-delegated-power: uint,
+    delegator-count: uint
 })
 
 ;; Initialize DAO
@@ -226,6 +240,7 @@
         (task-data (unwrap! (map-get? tasks task-id) err-task-not-found))
         (member-data (unwrap! (map-get? members tx-sender) err-not-member))
         (vote-key {task-id: task-id, voter: tx-sender})
+        (total-voting-power (get-total-voting-power tx-sender))
     )
         (asserts! (get is-active member-data) err-not-member)
         (asserts! (<= stacks-block-height (get voting-deadline task-data)) err-voting-closed)
@@ -236,10 +251,10 @@
         
         (if vote
             (map-set tasks task-id (merge task-data {
-                yes-votes: (+ (get yes-votes task-data) (get voting-power member-data))
+                yes-votes: (+ (get yes-votes task-data) total-voting-power)
             }))
             (map-set tasks task-id (merge task-data {
-                no-votes: (+ (get no-votes task-data) (get voting-power member-data))
+                no-votes: (+ (get no-votes task-data) total-voting-power)
             }))
         )
         (ok true)
@@ -361,6 +376,54 @@
     )
 )
 
+(define-public (delegate-voting-power (delegate principal))
+    (let (
+        (delegator-data (unwrap! (map-get? members tx-sender) err-not-member))
+        (delegate-data (unwrap! (map-get? members delegate) err-delegate-not-member))
+        (voting-power (get voting-power delegator-data))
+        (existing-delegation (map-get? vote-delegations tx-sender))
+    )
+        (asserts! (get is-active delegator-data) err-not-member)
+        (asserts! (get is-active delegate-data) err-delegate-not-member)
+        (asserts! (not (is-eq tx-sender delegate)) err-cannot-delegate-to-self)
+        
+        (match existing-delegation
+            prev-delegation
+            (if (get is-active prev-delegation)
+                (let ((prev-delegate (get delegate prev-delegation)))
+                    (unwrap-panic (remove-delegation-from-delegate prev-delegate voting-power))
+                )
+                true
+            )
+            true
+        )
+        
+        (map-set vote-delegations tx-sender {
+            delegate: delegate,
+            delegated-at: stacks-block-height,
+            is-active: true
+        })
+        
+        (unwrap-panic (add-delegation-to-delegate delegate voting-power))
+        (ok true)
+    )
+)
+
+(define-public (revoke-delegation)
+    (let (
+        (delegator-data (unwrap! (map-get? members tx-sender) err-not-member))
+        (delegation (unwrap! (map-get? vote-delegations tx-sender) err-no-delegation-exists))
+        (voting-power (get voting-power delegator-data))
+    )
+        (asserts! (get is-active delegation) err-no-delegation-exists)
+        
+        (map-set vote-delegations tx-sender (merge delegation {is-active: false}))
+        
+        (unwrap-panic (remove-delegation-from-delegate (get delegate delegation) voting-power))
+        (ok true)
+    )
+)
+
 ;; Private helper functions for rewards system
 (define-private (update-member-contributions (member principal) (compensation uint) (complexity uint))
     (match (map-get? member-contributions member)
@@ -447,10 +510,8 @@
             (let (
                 (individual-reward (/ (* base-reward multiplier contribution-score) u10000))
             )
-                ;; Transfer reward (simplified - in practice, handle errors)
                 (match (as-contract (stx-transfer? individual-reward tx-sender member))
                     success (begin
-                        ;; Update member rewards record
                         (map-set member-rewards member (merge reward-data {
                             total-rewards-received: (+ (get total-rewards-received reward-data) individual-reward),
                             last-reward-date: stacks-block-height
@@ -462,6 +523,36 @@
             )
             accumulated-total
         )
+    )
+)
+
+(define-private (add-delegation-to-delegate (delegate principal) (voting-power uint))
+    (let (
+        (current-delegation (default-to {total-delegated-power: u0, delegator-count: u0}
+                                       (map-get? delegation-received delegate)))
+    )
+        (map-set delegation-received delegate {
+            total-delegated-power: (+ (get total-delegated-power current-delegation) voting-power),
+            delegator-count: (+ (get delegator-count current-delegation) u1)
+        })
+        (ok true)
+    )
+)
+
+(define-private (remove-delegation-from-delegate (delegate principal) (voting-power uint))
+    (let (
+        (current-delegation (default-to {total-delegated-power: u0, delegator-count: u0}
+                                       (map-get? delegation-received delegate)))
+    )
+        (map-set delegation-received delegate {
+            total-delegated-power: (if (>= (get total-delegated-power current-delegation) voting-power)
+                                      (- (get total-delegated-power current-delegation) voting-power)
+                                      u0),
+            delegator-count: (if (> (get delegator-count current-delegation) u0)
+                                (- (get delegator-count current-delegation) u1)
+                                u0)
+        })
+        (ok true)
     )
 )
 
@@ -545,5 +636,24 @@
     (match (map-get? members member)
         member-data (get is-active member-data)
         false
+    )
+)
+
+(define-read-only (get-delegation (member principal))
+    (map-get? vote-delegations member)
+)
+
+(define-read-only (get-delegation-received (delegate principal))
+    (map-get? delegation-received delegate)
+)
+
+(define-read-only (get-total-voting-power (member principal))
+    (let (
+        (member-data (unwrap! (map-get? members member) u0))
+        (base-power (get voting-power member-data))
+        (delegated-power (default-to {total-delegated-power: u0, delegator-count: u0}
+                                     (map-get? delegation-received member)))
+    )
+        (+ base-power (get total-delegated-power delegated-power))
     )
 )
